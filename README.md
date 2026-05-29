@@ -58,12 +58,12 @@ python sitemap_indexer.py --sitemap https://example.com/sitemap.xml --key servic
 
 | Flag | Required | Default | Description |
 |---|---|---|---|
-| `--sitemap` | Yes | `none` | Live URL of your sitemap or sitemap index |
-| `--key` | Yes | `none` | Path to your service account JSON key file |
-| `--delay` | No | `1.0` | Seconds between API requests |
-| `--retries` | No | `3` | Max retries on rate-limit or server errors |
-| `--backoff` | No | `5.0` | Base backoff seconds (multiplied by attempt number) |
-| `--log-file` | No | `indexing_log.txt` | Path to write the full log |
+| `--sitemap` | Yes | | Live URL of your sitemap or sitemap index |
+| `--key` | Yes | | Path to your service account JSON key file |
+| `--delay` | No | `1.0` | Seconds between API requests (must be > 0) |
+| `--retries` | No | `3` | Max retries on rate-limit or server errors (must be >= 1) |
+| `--backoff` | No | `5.0` | Base backoff seconds, multiplied by attempt number (must be > 0) |
+| `--log-file` | No | `indexing_log.txt` | Path to write the full DEBUG log |
 
 ### Examples
 
@@ -92,12 +92,11 @@ python sitemap_indexer.py \
 
 ## Output
 
-The script logs to both the terminal and the log file.
+The script logs to both the terminal and the log file. The terminal shows INFO and above; the log file captures everything including DEBUG.
 
 ```
 2026-01-15 10:32:01 [INFO] Sitemap Indexer started.
 2026-01-15 10:32:01 [INFO] Sitemap : https://example.com/sitemap.xml
-2026-01-15 10:32:01 [INFO] Key file: service_account.json
 2026-01-15 10:32:02 [INFO] Fetching sitemap: https://example.com/sitemap.xml
 2026-01-15 10:32:02 [INFO] Found 42 URLs in: https://example.com/sitemap.xml
 2026-01-15 10:32:02 [INFO] Total unique URLs to submit: 42
@@ -108,6 +107,7 @@ The script logs to both the terminal and the log file.
 2026-01-15 10:33:24 [INFO] Total   : 42
 2026-01-15 10:33:24 [INFO] Success : 41
 2026-01-15 10:33:24 [INFO] Failed  : 1
+2026-01-15 10:33:24 [INFO] Full log written to indexing_log.txt
 ```
 
 ---
@@ -116,14 +116,27 @@ The script logs to both the terminal and the log file.
 
 The Google Indexing API allows **200 requests per day** by default per Search Console property. You can request a quota increase in Google Cloud Console if needed.
 
-The default `--delay 1.0` keeps submissions safe and predictable. Do not set it below `0.5` without a quota increase.
+The default `--delay 1.0` keeps submissions safe and predictable.
+
+---
+
+## Error handling
+
+| HTTP status | Behaviour |
+|---|---|
+| 400 | Fails immediately. The URL is malformed or not owned by the Search Console property. |
+| 403 | Fails immediately. The service account is not an Owner in Search Console. |
+| 404 | Fails immediately. The URL is not publicly accessible. |
+| 429 | Retries with backoff up to `--retries` times, then fails. |
+| 5xx | Retries with backoff up to `--retries` times, then fails. |
+
+Failed URLs are listed individually in the summary and in the log file. A failed URL does not stop the remaining submissions.
 
 ---
 
 ## Security
 
-- **Never commit your service account JSON key to version control.** The `.gitignore` in this repo excludes all `*.json` files for this reason.
-- Store the key file outside the repo or use an environment variable / secrets manager in production.
+Never commit your service account JSON key to version control. The `.gitignore` in this repo excludes all `*.json` files for this reason. Store the key file outside the repo, or use an environment variable or secrets manager in production.
 
 ---
 
