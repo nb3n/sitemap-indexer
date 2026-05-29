@@ -1,0 +1,20 @@
+# Service account keys — NEVER commit these
+*.json
+
+# Log output
+*.txt
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+.venv/
+venv/
+env/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
