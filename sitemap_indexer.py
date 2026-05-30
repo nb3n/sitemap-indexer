@@ -470,27 +470,46 @@ class IndexingApiClient:
         failed: list[tuple[str, str]] = []
         total = len(pending)
 
-        for index, url in enumerate(pending, start=1):
-            self._log.info("[%d/%d] Submitting: %s", index, total, url)
-            try:
-                response = self.submit(url)
-                notify_time = (
-                    response
-                    .get("urlNotificationMetadata", {})
-                    .get("latestUpdate", {})
-                    .get("notifyTime", "N/A")
-                )
-                self._log.info("Accepted. Notify time: %s", notify_time)
-                succeeded.append(url)
-                if resume_file:
-                    with open(resume_file, "a", encoding="utf-8") as fh:
-                        fh.write(url + "\n")
-            except RuntimeError as exc:
-                self._log.error("Failed: %s", exc)
-                failed.append((url, str(exc)))
+        try:
+            for index, url in enumerate(pending, start=1):
+                self._log.info("[%d/%d] Submitting: %s", index, total, url)
+                try:
+                    response = self.submit(url)
+                    notify_time = (
+                        response
+                        .get("urlNotificationMetadata", {})
+                        .get("latestUpdate", {})
+                        .get("notifyTime", "N/A")
+                    )
+                    self._log.info("Accepted. Notify time: %s", notify_time)
+                    succeeded.append(url)
+                    if resume_file:
+                        with open(resume_file, "a", encoding="utf-8") as fh:
+                            fh.write(url + "\n")
+                except RuntimeError as exc:
+                    self._log.error("Failed: %s", exc)
+                    failed.append((url, str(exc)))
 
-            if index < total:
-                time.sleep(self._request_delay)
+                if index < total:
+                    time.sleep(self._request_delay)
+
+        except KeyboardInterrupt:
+            remaining = total - index
+            self._log.warning(
+                "Interrupted after %d/%d URLs. %d not attempted.",
+                index, total, remaining,
+            )
+            if resume_file:
+                self._log.info(
+                    "Resume file '%s' is up to date. Re-run with the same "
+                    "--resume-file flag to continue from where this stopped.",
+                    resume_file,
+                )
+            else:
+                self._log.info(
+                    "Tip: use --resume-file to avoid resubmitting completed "
+                    "URLs on the next run."
+                )
 
         return SubmissionResult(
             total=len(urls),
@@ -610,7 +629,9 @@ class SitemapIndexer:
         )
         self._log_summary(result)
 
-        return 1 if result.failure_count else 0
+        attempted = result.success_count + result.failure_count
+        interrupted = attempted < result.total
+        return 1 if (interrupted or result.failure_count) else 0
 
     def _load_resume_set(self) -> set[str]:
         """
