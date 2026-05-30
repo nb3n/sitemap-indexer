@@ -63,7 +63,7 @@ python sitemap_indexer.py --sitemap https://example.com/sitemap.xml --key servic
 | `--delay` | No | `1.0` | Seconds between API requests (must be > 0) |
 | `--retries` | No | `3` | Max retries on rate-limit or server errors (must be >= 1) |
 | `--backoff` | No | `5.0` | Base backoff seconds, multiplied by attempt number (must be > 0) |
-| `--log-file` | No | `indexing_log.txt` | Path to write the full DEBUG log (parent dirs created automatically) |
+| `--log-file` | No | `logs/indexing.log` | Path to write the full DEBUG log (parent dirs created automatically) |
 | `--dry-run` | No | off | Parse and list URLs without submitting anything |
 | `--filter` | No | | Regex; only matching URLs are submitted |
 | `--resume-file` | No | | File to record and skip already-submitted URLs across runs |
@@ -98,7 +98,7 @@ python sitemap_indexer.py \
 python sitemap_indexer.py \
   --sitemap https://example.com/sitemap.xml \
   --key service_account.json \
-  --log-file logs/run_2026.txt
+  --log-file logs/run_2026.log
 
 # Slower submission with more retries
 python sitemap_indexer.py \
@@ -129,7 +129,7 @@ The script logs to both the terminal (INFO and above) and the log file (full DEB
 2026-01-15 10:33:24 [INFO] Total   : 42
 2026-01-15 10:33:24 [INFO] Success : 41
 2026-01-15 10:33:24 [INFO] Failed  : 1
-2026-01-15 10:33:24 [INFO] Full log written to indexing_log.txt
+2026-01-15 10:33:24 [INFO] Full log written to logs/indexing.log
 ```
 
 ---
