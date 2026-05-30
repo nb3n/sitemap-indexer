@@ -1,13 +1,15 @@
 """
-sitemap_indexer.py
-
 Fetches all URLs from a live XML sitemap (including sitemap index files)
 and submits each one to the Google Indexing API v3.
 
 Handles:
   - Standard sitemaps and recursive sitemap index files
+  - Gzip-compressed sitemaps (.xml.gz)
   - Automatic retries with configurable backoff on transient errors
   - Per-request delay to stay within the 200 req/day default quota
+  - Dry-run mode to preview URLs without submitting
+  - URL pattern filtering to target specific sections of a site
+  - Resume support to skip already-submitted URLs across interrupted runs
   - Dual output: console (INFO) and file (DEBUG)
 
 Prerequisites:
@@ -22,9 +24,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gzip
 import logging
+import re
 import sys
 import time
+from pathlib import Path
 from urllib.parse import urlparse
 from xml.etree import ElementTree as ET
 
@@ -35,6 +40,14 @@ from googleapiclient.errors import HttpError
 
 
 # ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+_GZIP_MAGIC = b"\x1f\x8b"
+_DAILY_QUOTA = 200
+
+
+# ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 
@@ -42,8 +55,18 @@ def configure_logging(log_file: str) -> logging.Logger:
     """
     Create and return a logger that writes INFO to stdout and DEBUG to a file.
 
-    Guards against duplicate handlers so the function is safe to call more
-    than once within the same process (e.g. in tests).
+    Creates any missing parent directories for the log file. Guards against
+    duplicate handlers so the function is safe to call more than once within
+    the same process (e.g. in tests).
+
+    Args:
+        log_file: File path to write the full DEBUG log.
+
+    Returns:
+        Configured Logger instance named 'sitemap_indexer'.
+
+    Raises:
+        OSError: If the log file directory cannot be created.
     """
     logger = logging.getLogger("sitemap_indexer")
 
@@ -51,25 +74,27 @@ def configure_logging(log_file: str) -> logging.Logger:
         return logger
 
     logger.setLevel(logging.DEBUG)
-
     formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
     stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setLevel(logging.INFO)
     stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+
+    log_path = Path(log_file)
+    if log_path.parent != Path("."):
+        log_path.parent.mkdir(parents=True, exist_ok=True)
 
     file_handler = logging.FileHandler(log_file, encoding="utf-8")
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(formatter)
-
-    logger.addHandler(stream_handler)
     logger.addHandler(file_handler)
 
     return logger
 
 
 # ---------------------------------------------------------------------------
-# Sitemap Parser
+# Sitemap parser
 # ---------------------------------------------------------------------------
 
 class SitemapParser:
@@ -77,24 +102,35 @@ class SitemapParser:
     Fetches and parses XML sitemaps from live URLs.
 
     Handles both standard sitemaps (<urlset>) and sitemap index files
-    (<sitemapindex>) recursively. Skips already-visited URLs to prevent
-    infinite loops caused by circular references in sitemap indexes.
+    (<sitemapindex>) recursively. Transparently decompresses gzip responses
+    so plain and .xml.gz sitemaps both work without extra configuration.
+
+    Circular references in sitemap indexes are detected and skipped to
+    prevent infinite recursion.
 
     Args:
         logger: Logger instance to use for output.
         request_timeout: Seconds before an HTTP request times out.
     """
 
-    SITEMAP_NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+    _SITEMAP_NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
 
-    def __init__(self, logger: logging.Logger, request_timeout: int = 30) -> None:
+    def __init__(self, logger: logging.Logger, request_timeout: float = 30.0) -> None:
         self._log = logger
         self._timeout = request_timeout
+        self._session = requests.Session()
+        self._session.headers.update({"User-Agent": "SitemapIndexer/3.0"})
 
     def extract_urls(self, sitemap_url: str) -> list[str]:
         """
         Return a deduplicated, ordered list of all page URLs found in the
         sitemap at `sitemap_url`, recursing into child sitemaps as needed.
+
+        Args:
+            sitemap_url: Live URL of the sitemap or sitemap index.
+
+        Returns:
+            Deduplicated list of page URLs preserving discovery order.
 
         Raises:
             RuntimeError: If the sitemap cannot be fetched or parsed.
@@ -110,7 +146,6 @@ class SitemapParser:
 
         visited.add(url)
         self._log.info("Fetching sitemap: %s", url)
-
         root = self._fetch_xml(url)
 
         if "sitemapindex" in root.tag:
@@ -120,19 +155,25 @@ class SitemapParser:
 
     def _fetch_xml(self, url: str) -> ET.Element:
         """
-        Fetch `url` over HTTP and return the parsed XML root element.
+        Fetch `url` and return the parsed XML root element.
+
+        Transparently decompresses gzip responses. Raises RuntimeError for
+        all network, HTTP, and XML parsing failures.
+
+        Args:
+            url: URL to fetch.
+
+        Returns:
+            Root element of the parsed XML document.
 
         Raises:
             RuntimeError: On connection errors, HTTP errors, or invalid XML.
         """
         try:
-            response = requests.get(
-                url,
-                timeout=self._timeout,
-                headers={"User-Agent": "SitemapIndexer/2.0"},
-            )
+            response = self._session.get(url, timeout=self._timeout)
             response.raise_for_status()
-            return ET.fromstring(response.content)
+            content = _decompress_if_gzip(response.content, url)
+            return ET.fromstring(content)
         except requests.exceptions.Timeout as exc:
             raise RuntimeError(f"Request timed out fetching: {url}") from exc
         except requests.exceptions.ConnectionError as exc:
@@ -147,7 +188,10 @@ class SitemapParser:
             raise RuntimeError(f"Invalid XML returned from {url}: {exc}") from exc
 
     def _process_index(self, root: ET.Element, visited: set[str]) -> list[str]:
-        locs = root.findall("sm:sitemap/sm:loc", self.SITEMAP_NS) or root.findall(".//loc")
+        locs = (
+            root.findall("sm:sitemap/sm:loc", self._SITEMAP_NS)
+            or root.findall(".//loc")
+        )
         self._log.info("Sitemap index found with %d child sitemaps.", len(locs))
 
         urls: list[str] = []
@@ -158,15 +202,42 @@ class SitemapParser:
         return urls
 
     def _process_sitemap(self, root: ET.Element, source_url: str) -> list[str]:
-        locs = root.findall("sm:url/sm:loc", self.SITEMAP_NS) or root.findall(".//loc")
+        locs = (
+            root.findall("sm:url/sm:loc", self._SITEMAP_NS)
+            or root.findall(".//loc")
+        )
         self._log.info("Found %d URLs in: %s", len(locs), source_url)
 
-        urls: list[str] = []
-        for loc in locs:
-            page_url = (loc.text or "").strip()
-            if page_url:
-                urls.append(page_url)
-        return urls
+        return [
+            page_url
+            for loc in locs
+            if (page_url := (loc.text or "").strip())
+        ]
+
+
+def _decompress_if_gzip(content: bytes, url: str) -> bytes:
+    """
+    Return decompressed bytes if `content` is gzip-encoded, or return it
+    unchanged if it is plain XML.
+
+    Args:
+        content: Raw response bytes.
+        url: Source URL, used only in the error message on failed decompression.
+
+    Returns:
+        Decompressed or original bytes.
+
+    Raises:
+        RuntimeError: If content looks like gzip but cannot be decompressed.
+    """
+    if not content.startswith(_GZIP_MAGIC):
+        return content
+    try:
+        return gzip.decompress(content)
+    except OSError as exc:
+        raise RuntimeError(
+            f"Failed to decompress gzip content from {url}: {exc}"
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -175,26 +246,41 @@ class SitemapParser:
 
 class SubmissionResult:
     """
-    Holds the outcome of a batch URL submission.
+    Immutable-by-convention record of a batch URL submission outcome.
 
     Attributes:
-        total: Number of URLs attempted.
-        succeeded: URLs accepted by the API.
-        failed: (url, error_message) pairs for each failure.
+        total: Number of URLs in the original list (including any skipped by resume).
+        succeeded: URLs accepted by the API, in submission order.
+        failed: (url, error_message) pairs for each rejection, in order.
     """
 
-    def __init__(self) -> None:
-        self.total: int = 0
-        self.succeeded: list[str] = []
-        self.failed: list[tuple[str, str]] = []
+    def __init__(
+        self,
+        total: int,
+        succeeded: list[str],
+        failed: list[tuple[str, str]],
+    ) -> None:
+        self.total = total
+        self.succeeded = succeeded
+        self.failed = failed
 
     @property
     def success_count(self) -> int:
+        """Number of successfully submitted URLs."""
         return len(self.succeeded)
 
     @property
     def failure_count(self) -> int:
+        """Number of URLs that could not be submitted."""
         return len(self.failed)
+
+    def __repr__(self) -> str:
+        return (
+            f"SubmissionResult("
+            f"total={self.total}, "
+            f"success={self.success_count}, "
+            f"failed={self.failure_count})"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +305,7 @@ class IndexingApiClient:
         RuntimeError: If the key file is missing or authentication fails.
     """
 
-    SCOPES = ["https://www.googleapis.com/auth/indexing"]
+    _SCOPES = ["https://www.googleapis.com/auth/indexing"]
 
     def __init__(
         self,
@@ -239,14 +325,19 @@ class IndexingApiClient:
         """
         Build and return an authenticated Google API service object.
 
+        Args:
+            service_account_file: Path to the service account JSON key.
+
         Raises:
             RuntimeError: If the key file is not found or credentials are invalid.
         """
         try:
             credentials = service_account.Credentials.from_service_account_file(
-                service_account_file, scopes=self.SCOPES
+                service_account_file, scopes=self._SCOPES
             )
-            service = build("indexing", "v3", credentials=credentials, cache_discovery=False)
+            service = build(
+                "indexing", "v3", credentials=credentials, cache_discovery=False
+            )
             self._log.info("Authenticated with Google Indexing API.")
             return service
         except FileNotFoundError:
@@ -262,14 +353,13 @@ class IndexingApiClient:
         Submit a single URL for indexing notification.
 
         Retries automatically on HTTP 429 (rate limit) and 5xx (server) errors.
-        Raises immediately on 400, 403, and 404 since those indicate permanent
-        problems that retrying will not resolve.
+        Fails immediately on 400, 403, and 404 because retrying will not help.
 
         Args:
             url: The page URL to submit.
 
         Returns:
-            The raw API response dict on success.
+            Raw API response dict on success.
 
         Raises:
             RuntimeError: On permanent errors or after exhausting all retries.
@@ -278,7 +368,11 @@ class IndexingApiClient:
 
         for attempt in range(1, self._max_retries + 1):
             try:
-                return self._service.urlNotifications().publish(body=body).execute()
+                return (
+                    self._service.urlNotifications()
+                    .publish(body=body)
+                    .execute(num_retries=0)
+                )
 
             except HttpError as exc:
                 status = exc.resp.status
@@ -320,26 +414,64 @@ class IndexingApiClient:
                 ) from exc
 
             except Exception as exc:
-                raise RuntimeError(f"Unexpected error submitting {url}: {exc}") from exc
+                raise RuntimeError(
+                    f"Unexpected error submitting {url}: {exc}"
+                ) from exc
 
-        # Unreachable: the loop always returns or raises, but satisfies type checkers.
-        raise RuntimeError(f"Submission failed for {url} after {self._max_retries} retries.")
+        # Unreachable: every code path above returns or raises.
+        raise RuntimeError(
+            f"Submission failed for {url} after {self._max_retries} retries."
+        )
 
-    def submit_all(self, urls: list[str]) -> SubmissionResult:
+    def submit_all(
+        self,
+        urls: list[str],
+        resume_set: set[str] | None = None,
+        resume_file: str | None = None,
+    ) -> SubmissionResult:
         """
         Submit all URLs sequentially, pausing `request_delay` seconds between calls.
 
+        URLs present in `resume_set` are skipped and counted as already succeeded
+        so the summary reflects the full picture across runs. Each newly accepted
+        URL is appended to `resume_file` immediately so a crash mid-run can be
+        resumed without resubmitting completed URLs.
+
+        Emits a quota warning if the number of new submissions in this run meets
+        or exceeds the default daily limit of 200 requests.
+
         Args:
             urls: Ordered list of page URLs to submit.
+            resume_set: URLs already submitted in a previous run; skipped here.
+            resume_file: Path to append each newly accepted URL to.
 
         Returns:
-            A SubmissionResult with success and failure details.
+            SubmissionResult with counts and URL lists for this run.
         """
-        result = SubmissionResult()
-        result.total = len(urls)
+        resume_set = resume_set or set()
+        skipped = [u for u in urls if u in resume_set]
+        pending = [u for u in urls if u not in resume_set]
 
-        for index, url in enumerate(urls, start=1):
-            self._log.info("[%d/%d] Submitting: %s", index, result.total, url)
+        if skipped:
+            self._log.info(
+                "Skipping %d already-submitted URLs (resume).", len(skipped)
+            )
+
+        if len(pending) >= _DAILY_QUOTA:
+            self._log.warning(
+                "This run will submit %d URLs, which meets or exceeds the default "
+                "daily quota of %d. Consider splitting into batches or requesting "
+                "a quota increase in Google Cloud Console.",
+                len(pending),
+                _DAILY_QUOTA,
+            )
+
+        succeeded: list[str] = list(skipped)
+        failed: list[tuple[str, str]] = []
+        total = len(pending)
+
+        for index, url in enumerate(pending, start=1):
+            self._log.info("[%d/%d] Submitting: %s", index, total, url)
             try:
                 response = self.submit(url)
                 notify_time = (
@@ -349,15 +481,22 @@ class IndexingApiClient:
                     .get("notifyTime", "N/A")
                 )
                 self._log.info("Accepted. Notify time: %s", notify_time)
-                result.succeeded.append(url)
+                succeeded.append(url)
+                if resume_file:
+                    with open(resume_file, "a", encoding="utf-8") as fh:
+                        fh.write(url + "\n")
             except RuntimeError as exc:
                 self._log.error("Failed: %s", exc)
-                result.failed.append((url, str(exc)))
+                failed.append((url, str(exc)))
 
-            if index < result.total:
+            if index < total:
                 time.sleep(self._request_delay)
 
-        return result
+        return SubmissionResult(
+            total=len(urls),
+            succeeded=succeeded,
+            failed=failed,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -375,9 +514,12 @@ class SitemapIndexer:
         max_retries: Maximum retries on transient failures. Default is 3.
         retry_backoff: Base backoff seconds per retry attempt. Default is 5.0.
         log_file: Path to write the full DEBUG log. Default is indexing_log.txt.
+        dry_run: If True, parse the sitemap and log URLs without submitting.
+        url_pattern: Optional regex; only matching URLs are submitted.
+        resume_file: Path to a file of previously submitted URLs to skip.
 
     Raises:
-        ValueError: If `sitemap_url` does not start with http:// or https://.
+        ValueError: If `sitemap_url` is not a valid http or https URL.
     """
 
     def __init__(
@@ -388,52 +530,105 @@ class SitemapIndexer:
         max_retries: int = 3,
         retry_backoff: float = 5.0,
         log_file: str = "indexing_log.txt",
+        dry_run: bool = False,
+        url_pattern: str | None = None,
+        resume_file: str | None = None,
     ) -> None:
-        self._validate_url(sitemap_url)
+        _validate_sitemap_url(sitemap_url)
+
         self._sitemap_url = sitemap_url
         self._log_file = log_file
-        self._log = configure_logging(log_file)
-        self._parser = SitemapParser(logger=self._log)
-        self._client = IndexingApiClient(
-            service_account_file=service_account_file,
-            logger=self._log,
-            request_delay=request_delay,
-            max_retries=max_retries,
-            retry_backoff=retry_backoff,
-        )
+        self._dry_run = dry_run
+        self._url_pattern = re.compile(url_pattern) if url_pattern else None
+        self._resume_file = resume_file
 
-    @staticmethod
-    def _validate_url(url: str) -> None:
-        parsed = urlparse(url)
-        if parsed.scheme not in ("http", "https"):
-            raise ValueError(
-                f"Sitemap URL must start with http:// or https://. Got: {url!r}"
+        self._log = configure_logging(log_file)
+        self._log.info("Sitemap : %s", self._sitemap_url)
+        self._log.info("Key file: %s", service_account_file)
+
+        self._parser = SitemapParser(logger=self._log)
+        self._client: IndexingApiClient | None = None
+
+        if not dry_run:
+            self._client = IndexingApiClient(
+                service_account_file=service_account_file,
+                logger=self._log,
+                request_delay=request_delay,
+                max_retries=max_retries,
+                retry_backoff=retry_backoff,
             )
 
-    def run(self) -> None:
+    def run(self) -> int:
         """
         Parse the sitemap, submit all discovered URLs, and log a summary.
 
-        Exits the process with code 1 if the sitemap cannot be fetched,
-        or code 0 if there are no URLs to submit.
+        Returns:
+            0 on full success or dry run.
+            1 if the sitemap could not be fetched or any submissions failed.
         """
-        self._log.info("Sitemap Indexer started.")
-        self._log.info("Sitemap : %s", self._sitemap_url)
+        self._log.info(
+            "Sitemap Indexer started.%s", " [DRY RUN]" if self._dry_run else ""
+        )
 
         try:
             urls = self._parser.extract_urls(self._sitemap_url)
         except RuntimeError as exc:
             self._log.error("Sitemap parsing failed: %s", exc)
-            sys.exit(1)
+            return 1
 
         if not urls:
             self._log.warning("No URLs found in sitemap. Nothing to submit.")
-            sys.exit(0)
+            return 0
 
+        if self._url_pattern is not None:
+            before = len(urls)
+            urls = [u for u in urls if self._url_pattern.search(u)]
+            self._log.info(
+                "Pattern '%s' matched %d of %d URLs.",
+                self._url_pattern.pattern, len(urls), before,
+            )
+
+        if not urls:
+            self._log.warning(
+                "No URLs matched the filter pattern. Nothing to submit."
+            )
+            return 0
+
+        if self._dry_run:
+            self._log.info("Dry run: %d URLs would be submitted:", len(urls))
+            for url in urls:
+                self._log.info("  %s", url)
+            return 0
+
+        resume_set = self._load_resume_set()
         self._log.info("Total unique URLs to submit: %d", len(urls))
 
-        result = self._client.submit_all(urls)
+        result = self._client.submit_all(
+            urls,
+            resume_set=resume_set,
+            resume_file=self._resume_file,
+        )
         self._log_summary(result)
+
+        return 1 if result.failure_count else 0
+
+    def _load_resume_set(self) -> set[str]:
+        """
+        Return the set of URLs recorded in the resume file, or an empty set
+        if no resume file was specified or the file does not yet exist.
+        """
+        if not self._resume_file:
+            return set()
+        try:
+            with open(self._resume_file, encoding="utf-8") as fh:
+                urls = {line.strip() for line in fh if line.strip()}
+            self._log.info(
+                "Loaded %d URLs from resume file: %s",
+                len(urls), self._resume_file,
+            )
+            return urls
+        except FileNotFoundError:
+            return set()
 
     def _log_summary(self, result: SubmissionResult) -> None:
         self._log.info("--- Summary ---")
@@ -450,20 +645,55 @@ class SitemapIndexer:
 
 
 # ---------------------------------------------------------------------------
-# Argument validation helpers
+# Validation helpers
 # ---------------------------------------------------------------------------
 
+def _validate_sitemap_url(url: str) -> None:
+    """
+    Raise ValueError if `url` is not a valid http or https URL with a host.
+
+    Args:
+        url: The URL string to validate.
+
+    Raises:
+        ValueError: If the scheme is not http/https or the host is missing.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(
+            f"Sitemap URL must start with http:// or https://. Got: {url!r}"
+        )
+    if not parsed.netloc:
+        raise ValueError(f"Sitemap URL has no host: {url!r}")
+
+
 def _positive_float(value: str) -> float:
-    """Argparse type that rejects zero and negative floats."""
-    f = float(value)
+    """
+    Argparse type converter that accepts only positive (> 0) floats.
+
+    Raises:
+        argparse.ArgumentTypeError: If the value is not a valid positive float.
+    """
+    try:
+        f = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a number, got {value!r}")
     if f <= 0:
-        raise argparse.ArgumentTypeError(f"must be a positive number, got {value!r}")
+        raise argparse.ArgumentTypeError(f"must be > 0, got {value!r}")
     return f
 
 
 def _positive_int(value: str) -> int:
-    """Argparse type that rejects zero and negative integers."""
-    i = int(value)
+    """
+    Argparse type converter that accepts only integers >= 1.
+
+    Raises:
+        argparse.ArgumentTypeError: If the value is not a valid integer >= 1.
+    """
+    try:
+        i = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected an integer, got {value!r}")
     if i < 1:
         raise argparse.ArgumentTypeError(f"must be >= 1, got {value!r}")
     return i
@@ -535,6 +765,34 @@ def parse_args() -> argparse.Namespace:
         metavar="PATH",
         help="Path to write the full DEBUG log. Default: indexing_log.txt.",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Parse the sitemap and log all discovered URLs without submitting "
+            "anything to the Indexing API. Useful for verifying sitemap content "
+            "and filter patterns before a live run."
+        ),
+    )
+    parser.add_argument(
+        "--filter",
+        dest="url_pattern",
+        metavar="REGEX",
+        help=(
+            "Only submit URLs matching this regular expression. "
+            "Example: --filter '/blog/' submits only URLs that contain /blog/."
+        ),
+    )
+    parser.add_argument(
+        "--resume-file",
+        metavar="PATH",
+        help=(
+            "Path to a plain-text file used for resume support. "
+            "Successfully submitted URLs are appended here after each acceptance. "
+            "On the next run, URLs already in this file are skipped automatically. "
+            "Useful for resuming large or interrupted runs without resubmitting."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -548,12 +806,15 @@ def main() -> None:
             max_retries=args.retries,
             retry_backoff=args.backoff,
             log_file=args.log_file,
+            dry_run=args.dry_run,
+            url_pattern=args.url_pattern,
+            resume_file=args.resume_file,
         )
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    indexer.run()
+    sys.exit(indexer.run())
 
 
 if __name__ == "__main__":
