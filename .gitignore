@@ -1,12 +1,11 @@
 # Service account keys / NEVER commit these
 *.json
 
-# Log output
-*.log
+# Log output (stored in logs/ by default)
 logs/
 
 # Resume and filter files - uncomment to exclude from version control
-submitted_urls.txt
+# submitted_urls.txt
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
