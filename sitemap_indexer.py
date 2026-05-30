@@ -532,7 +532,7 @@ class SitemapIndexer:
         request_delay: Seconds between API requests. Default is 1.0.
         max_retries: Maximum retries on transient failures. Default is 3.
         retry_backoff: Base backoff seconds per retry attempt. Default is 5.0.
-        log_file: Path to write the full DEBUG log. Default is indexing_log.txt.
+        log_file: Path to write the full DEBUG log. Default is logs/indexing.log.
         dry_run: If True, parse the sitemap and log URLs without submitting.
         url_pattern: Optional regex; only matching URLs are submitted.
         resume_file: Path to a file of previously submitted URLs to skip.
@@ -548,7 +548,7 @@ class SitemapIndexer:
         request_delay: float = 1.0,
         max_retries: int = 3,
         retry_backoff: float = 5.0,
-        log_file: str = "indexing_log.txt",
+        log_file: str = "logs/indexing.log",
         dry_run: bool = False,
         url_pattern: str | None = None,
         resume_file: str | None = None,
@@ -782,9 +782,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--log-file",
-        default="indexing_log.txt",
+        default="logs/indexing.log",
         metavar="PATH",
-        help="Path to write the full DEBUG log. Default: indexing_log.txt.",
+        help="Path to write the full DEBUG log. Default: logs/indexing.log.",
     )
     parser.add_argument(
         "--dry-run",
