@@ -190,3 +190,98 @@ Never commit your service account JSON key to version control. The `.gitignore` 
 ## License
 
 [MIT](LICENSE)
+
+---
+
+## deindex.py
+
+Removes URLs from Google's index by submitting `URL_DELETED` notifications via the Google Indexing API v3.
+
+Use this to clean up sandbox URLs accidentally indexed, deleted pages, duplicate www subdomain URLs, CDN domains, or malformed query string URLs that should not appear in search results.
+
+### Usage
+
+```bash
+# Remove specific URLs directly
+python deindex.py --key service_account.json https://sandbox.example.com/page
+
+# Remove all URLs listed in a file
+python deindex.py --key service_account.json --url-file bad_urls.txt
+
+# Combine both
+python deindex.py --key service_account.json --url-file bad_urls.txt https://extra.example.com/page
+
+# Preview what would be removed without touching the API
+python deindex.py --key service_account.json --url-file bad_urls.txt --dry-run
+```
+
+### All options
+
+| Flag | Required | Default | Description |
+|---|---|---|---|
+| `URL` (positional) | No | | One or more URLs to remove, passed directly as arguments |
+| `--key` | Yes | | Path to your service account JSON key file |
+| `--url-file` | No | | Path to a plain text file with one URL per line (# lines are comments) |
+| `--delay` | No | `1.0` | Seconds between API requests (must be > 0) |
+| `--retries` | No | `3` | Max retries on transient errors (must be >= 1) |
+| `--backoff` | No | `5.0` | Base backoff seconds, multiplied by attempt number (must be > 0) |
+| `--log-file` | No | `logs/deindex.log` | Path to write the full DEBUG log (parent dirs created automatically) |
+| `--dry-run` | No | off | List URLs that would be removed without calling the API |
+
+### URL file format
+
+Plain text, one URL per line. Lines starting with `#` are comments and are ignored.
+
+```
+# Sandbox URLs
+https://sandbox.example.com/en
+https://sandbox.example.com/about
+
+# CDN domain - serves assets only
+https://cdn.example.com
+
+# www duplicates
+https://www.example.com/contact
+https://www.example.com/services
+```
+
+### Output
+
+```
+2026-01-15 10:32:01 [INFO] Key file : service_account.json
+2026-01-15 10:32:01 [INFO] URLs to remove: 15
+2026-01-15 10:32:01 [INFO] Authenticated with Google Indexing API.
+2026-01-15 10:32:01 [INFO] [1/15] Removing: https://sandbox.example.com/en
+2026-01-15 10:32:02 [INFO] Accepted for removal.
+...
+2026-01-15 10:32:18 [INFO] --- Summary ---
+2026-01-15 10:32:18 [INFO] Total   : 15
+2026-01-15 10:32:18 [INFO] Removed : 15
+2026-01-15 10:32:18 [INFO] Failed  : 0
+2026-01-15 10:32:18 [INFO] Full log written to logs/deindex.log
+```
+
+### How long removal takes
+
+Removal typically takes 3 to 7 days. The URL disappears from search results once Google recrawls and confirms the page is gone. If the page still returns HTTP 200, Google may ignore the removal and reindex it.
+
+For permanent removal, combine the API call with two server-side changes:
+
+- Return HTTP 410 Gone (preferred) or 404 Not Found from the page
+- Add `Disallow: /` to `robots.txt` on the relevant domain (for subdomains like sandbox or CDN)
+
+A 410 is processed faster than a 404 because it signals the deletion is intentional and permanent.
+
+### Error handling
+
+| HTTP status | Behaviour |
+|---|---|
+| 400 | Fails immediately. The URL is malformed or not owned by the Search Console property. |
+| 403 | Fails immediately. The service account is not an Owner in Search Console. |
+| 404 | Fails immediately. The URL was not indexed or is already removed. |
+| 429 | Retries with backoff up to `--retries` times, then fails. |
+| 5xx | Retries with backoff up to `--retries` times, then fails. |
+
+### Quota
+
+`deindex.py` and `sitemap_indexer.py` share the same 200 requests/day quota. If you are running both on the same day, plan accordingly.
