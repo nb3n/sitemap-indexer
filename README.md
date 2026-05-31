@@ -179,21 +179,7 @@ python sitemap_indexer.py --sitemap ... --key ... --resume-file submitted_urls.t
 python sitemap_indexer.py --sitemap ... --key ... --resume-file submitted_urls.txt
 ```
 
----
-
-## Security
-
-Never commit your service account JSON key to version control. The `.gitignore` in this repo excludes all `*.json` files for this reason. Store the key file outside the repo, or use an environment variable or secrets manager in production.
-
----
-
-## License
-
-[MIT](LICENSE)
-
----
-
-## deindex.py
+## Deindex Url
 
 Removes URLs from Google's index by submitting `URL_DELETED` notifications via the Google Indexing API v3.
 
@@ -285,3 +271,15 @@ A 410 is processed faster than a 404 because it signals the deletion is intentio
 ### Quota
 
 `deindex.py` and `sitemap_indexer.py` share the same 200 requests/day quota. If you are running both on the same day, plan accordingly.
+
+---
+
+## Security
+
+Never commit your service account JSON key to version control. The `.gitignore` in this repo excludes all `*.json` files for this reason. Store the key file outside the repo, or use an environment variable or secrets manager in production.
+
+---
+
+## License
+
+[MIT](LICENSE)
