@@ -3,18 +3,34 @@ Removes URLs from Google's index by submitting URL_DELETED notifications
 via the Google Indexing API v3.
 
 Use this to clean up:
-  - Old sandbox or staging URLs accidentally indexed
-  - Deleted pages returning 404
-  - Duplicate URLs (old subdomains, www vs non-www, http vs https)
+  - Sandbox or staging URLs accidentally indexed
+  - Deleted pages returning 404 or 410
+  - Duplicate URLs from www subdomains, old subdomains, or malformed query strings
+  - CDN or asset domains that should never appear in search results
   - Any URL that should not appear in Google Search results
 
 How to provide URLs:
-  Pass one or more URLs directly on the command line, or point to a plain
-  text file with one URL per line (lines starting with # are ignored).
+  Pass one or more URLs directly as command-line arguments, point to a plain
+  text file with one URL per line, or combine both in a single run.
+  Lines in the file starting with # are treated as comments and ignored.
+
+Handles:
+  - Automatic retries with configurable backoff on transient errors
+  - Per-request delay to stay within the 200 req/day default quota
+  - Dry-run mode to preview removals without touching the API
+  - Graceful Ctrl+C handling with a summary of what was completed
+  - Dual output: console (INFO) and file (DEBUG)
 
 Prerequisites:
-  Same service account and Search Console setup as sitemap_indexer.py.
-  The service account email must be an Owner in Google Search Console.
+  1. Google Cloud project with the Indexing API enabled
+  2. Service Account with a downloaded JSON key file
+  3. Service account email added as an Owner in Google Search Console
+
+Note:
+  URL_DELETED tells Google to drop the URL from its index. Removal typically
+  takes 3 to 7 days. If the page still returns HTTP 200, Google may recrawl
+  and reindex it. For permanent removal, ensure the page returns 404 or 410
+  and add Disallow rules to robots.txt on the relevant domain.
 
 Usage:
   # Remove specific URLs directly
@@ -22,6 +38,9 @@ Usage:
 
   # Remove all URLs listed in a file
   python deindex.py --key service_account.json --url-file bad_urls.txt
+
+  # Combine both
+  python deindex.py --key service_account.json --url-file bad_urls.txt https://extra.example.com/page
 
   # Preview what would be removed without touching the API
   python deindex.py --key service_account.json --url-file bad_urls.txt --dry-run
@@ -110,19 +129,28 @@ class RemovalResult:
         succeeded: list[str],
         failed: list[tuple[str, str]],
     ) -> None:
+        """
+        Args:
+            total: Number of URLs that were attempted.
+            succeeded: URLs accepted for removal by the API.
+            failed: (url, error_message) pairs for each rejection.
+        """
         self.total = total
         self.succeeded = succeeded
         self.failed = failed
 
     @property
     def success_count(self) -> int:
+        """Number of successfully removed URLs."""
         return len(self.succeeded)
 
     @property
     def failure_count(self) -> int:
+        """Number of URLs that could not be removed."""
         return len(self.failed)
 
     def __repr__(self) -> str:
+        """Return a concise string representation for debugging."""
         return (
             f"RemovalResult("
             f"total={self.total}, "
@@ -160,6 +188,7 @@ class DeindexClient:
         max_retries: int = 3,
         retry_backoff: float = 5.0,
     ) -> None:
+        """Initialise the client and authenticate with the Google Indexing API."""
         self._log = logger
         self._request_delay = request_delay
         self._max_retries = max_retries
@@ -167,6 +196,15 @@ class DeindexClient:
         self._service = self._authenticate(service_account_file)
 
     def _authenticate(self, service_account_file: str):
+        """
+        Build and return an authenticated Google API service object.
+
+        Args:
+            service_account_file: Path to the service account JSON key.
+
+        Raises:
+            RuntimeError: If the key file is not found or credentials are invalid.
+        """
         try:
             credentials = service_account.Credentials.from_service_account_file(
                 service_account_file, scopes=self._SCOPES
@@ -361,6 +399,12 @@ def _validate_url(url: str) -> None:
 # ---------------------------------------------------------------------------
 
 def _positive_float(value: str) -> float:
+    """
+    Argparse type converter that accepts only positive (> 0) floats.
+
+    Raises:
+        argparse.ArgumentTypeError: If the value is not a valid positive float.
+    """
     try:
         f = float(value)
     except ValueError:
@@ -371,6 +415,12 @@ def _positive_float(value: str) -> float:
 
 
 def _positive_int(value: str) -> int:
+    """
+    Argparse type converter that accepts only integers >= 1.
+
+    Raises:
+        argparse.ArgumentTypeError: If the value is not a valid integer >= 1.
+    """
     try:
         i = int(value)
     except ValueError:
@@ -385,6 +435,7 @@ def _positive_int(value: str) -> int:
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
+    """Parse and return command-line arguments."""
     parser = argparse.ArgumentParser(
         description=(
             "Remove URLs from Google's index via the Indexing API (URL_DELETED).\n\n"
@@ -454,6 +505,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """Entry point: validate inputs, authenticate, and run removals."""
     args = parse_args()
     log = configure_logging(args.log_file)
 
