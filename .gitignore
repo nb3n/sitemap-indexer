@@ -4,8 +4,8 @@
 # Log output (stored in logs/ by default)
 logs/
 
-# Resume and filter files - uncomment to exclude from version control
-# submitted_urls.txt
+# Bad Urls, Resume and filter files (used by the deindex, resume and filter commands)
+*.txt
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
