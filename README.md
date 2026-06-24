@@ -326,18 +326,6 @@ IndexNow has no deletion API. To remove a URL from Bing:
 
 ---
 
-## Security
-
-Never commit your service account JSON key to version control. The `.gitignore` in this repo excludes all `*.json` files for this reason. Store the key file outside the repo, or use an environment variable or secrets manager in production.
-
----
-
-## License
-
-[MIT](LICENSE)
-
----
-
 ## deindex.py
 
 Removes URLs from Google's index by submitting `URL_DELETED` notifications via the Google Indexing API v3.
